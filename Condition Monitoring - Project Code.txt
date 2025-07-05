@@ -1,0 +1,163 @@
+/*  -------------------------------------------------------------
+    Wireless Vibration Monitoring – ESP32 + ADXL345 + ThingSpeak
+    Board  : ESP32 Dev Module
+    -------------------------------------------------------------
+    Functionality
+    1. Connect to Wi-Fi (SSID: WCY, PASS: wcywcywcy).
+    2. Read raw acceleration from ADXL345 via I2C.
+    3. Collect 64 samples / axis, perform FFT, find dominant peak.
+    4. Calculate mean vector magnitude over the window.
+    5. Upload X-peak, Y-peak, Z-peak, MeanMag to ThingSpeak.
+    -------------------------------------------------------------
+    Hardware wiring (default I2C pins – change if needed)
+      ESP32      ADXL345
+      3V3   -->  VCC
+      GND   -->  GND
+      GPIO21 --> SDA
+      GPIO22 --> SCL
+      Any    --> CS tied high (I2C mode)
+ ----------------------------------------------------------------- */
+
+#include <WiFi.h>
+#include <ThingSpeak.h>
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_ADXL345_U.h>
+#include "arduinoFFT.h"
+
+// ---------- Wi-Fi & ThingSpeak ----------
+const char* WIFI_SSID     = "WCY";
+const char* WIFI_PASSWORD = "wcywcywcy";
+
+const unsigned long CHANNEL_ID = 2992826;       // ThingSpeak Channel
+const char* WRITE_API_KEY      = "LG7RH8XSSLCR7W5P";
+
+WiFiClient client;
+
+// ---------- ADXL345 ----------
+Adafruit_ADXL345_Unified accel = Adafruit_ADXL345_Unified(12345);
+
+// ---------- FFT configuration ----------
+#define SAMPLES             64        // must be a power of 2
+#define SAMPLING_FREQUENCY  800.0     // Hz, adjust to your application
+
+double vRealX[SAMPLES], vImagX[SAMPLES];
+double vRealY[SAMPLES], vImagY[SAMPLES];
+double vRealZ[SAMPLES], vImagZ[SAMPLES];
+arduinoFFT FFT = arduinoFFT();
+
+// ---------- Timing helpers ----------
+const unsigned long MIN_TALK_TIME_MS = 20 * 1000UL;   // ThingSpeak minimum update interval (15 s), use 20 s for safety
+unsigned long lastUpload = 0;
+
+void connectWiFi()
+{
+  Serial.print("Connecting to Wi-Fi");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print('.');
+  }
+  Serial.print("\nConnected! IP = ");
+  Serial.println(WiFi.localIP());
+}
+
+void setupADXL345()
+{
+  if (!accel.begin()) {
+    Serial.println("ADXL345 not detected. Check wiring.");
+    while (true) { delay(10); }
+  }
+  // ±16 g, full resolution, ~100 Hz output data rate (ODR)
+  accel.setRange(ADXL345_RANGE_16_G);
+  accel.setDataRate(ADXL345_DATARATE_100_HZ);
+  Serial.println("ADXL345 ready.");
+}
+
+void setup()
+{
+  Serial.begin(115200);
+  delay(2000); // allow time to open monitor
+
+  connectWiFi();
+  ThingSpeak.begin(client);
+
+  setupADXL345();
+}
+
+void loop()
+{
+  // ---- 1. Acquire SAMPLES samples at fixed interval ----
+  const double samplingPeriodUs = round(1e6 / SAMPLING_FREQUENCY);
+  unsigned long microPrev = micros();
+
+  double magSum = 0.0;   // for mean magnitude
+
+  for (uint16_t i = 0; i < SAMPLES; i++) {
+    sensors_event_t event;
+    accel.getEvent(&event);
+
+    // Store acceleration (m/s²) -> convert to g by dividing 9.80665
+    vRealX[i] = event.acceleration.x / 9.80665;
+    vRealY[i] = event.acceleration.y / 9.80665;
+    vRealZ[i] = event.acceleration.z / 9.80665;
+
+    vImagX[i] = vImagY[i] = vImagZ[i] = 0.0;
+
+    // Accumulate vector magnitude for averaging
+    double mag = sqrt(vRealX[i]*vRealX[i] + vRealY[i]*vRealY[i] + vRealZ[i]*vRealZ[i]);
+    magSum += mag;
+
+    // Wait for next sample
+    while (micros() - microPrev < samplingPeriodUs) { /* busy-wait */ }
+    microPrev += samplingPeriodUs;
+  }
+
+  // ---- 2. Perform FFT for each axis ----
+  double peakX = performFFT(vRealX, vImagX);
+  double peakY = performFFT(vRealY, vImagY);
+  double peakZ = performFFT(vRealZ, vImagZ);
+
+  double meanMag = magSum / SAMPLES;
+
+  Serial.printf("Peak X: %.4f g | Peak Y: %.4f g | Peak Z: %.4f g | Mean: %.4f g\n",
+                peakX, peakY, peakZ, meanMag);
+
+  // ---- 3. Upload to ThingSpeak (respect rate limit) ----
+  if (millis() - lastUpload >= MIN_TALK_TIME_MS) {
+    ThingSpeak.setField(1, peakX);
+    ThingSpeak.setField(2, peakY);
+    ThingSpeak.setField(3, peakZ);
+    ThingSpeak.setField(4, meanMag);
+
+    int httpCode = ThingSpeak.writeFields(CHANNEL_ID, WRITE_API_KEY);
+
+    if (httpCode == 200) {
+      Serial.println("ThingSpeak update OK.");
+    } else {
+      Serial.printf("ThingSpeak update failed, HTTP error %d\n", httpCode);
+    }
+    lastUpload = millis();
+  }
+}
+
+/* ---------------------------------------------------------
+   performFFT()
+   Runs FFT on real[] / imag[] of length SAMPLES,
+   returns the highest magnitude (dominant peak) in g.
+   --------------------------------------------------------- */
+double performFFT(double* vReal, double* vImag)
+{
+  // Windowing – optional (Blackman-Harris for low leakage)
+  FFT.Windowing(vReal, SAMPLES, FFT_WIN_TYP_BLACKMAN_HARRIS, FFT_FORWARD);
+  FFT.Compute(vReal, vImag, SAMPLES, FFT_FORWARD);
+  FFT.ComplexToMagnitude(vReal, vImag, SAMPLES);
+
+  // Ignore DC component (k = 0), search for maximum magnitude
+  double peak = 0.0;
+  for (uint16_t i = 1; i < (SAMPLES / 2); i++) {
+    if (vReal[i] > peak) peak = vReal[i];
+  }
+  return peak;   // units: g (because input was already in g)
+} 
